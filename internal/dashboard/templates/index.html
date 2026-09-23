@@ -1,0 +1,61 @@
+{{template "head" .Page}}
+{{if .Flash}}<p class="panel flash">{{.Flash}}</p>{{end}}
+{{if .Pending}}<p class="panel banner"><span class="spinner"></span> Some handoffs are still being checked by the model — this page refreshes automatically.</p>{{end}}
+
+<div class="stats">
+  <div class="panel stat"><b>{{.Stats.Total}}</b><span>handoffs</span></div>
+  <div class="panel stat"><b>{{.Stats.Automatic}}</b><span>routed automatically</span></div>
+  <div class="panel stat"><b>{{.Stats.NeedsReview}}</b><span>waiting on a human</span></div>
+  <div class="panel stat"><b>{{len .Outbox}}</b><span>actions taken</span></div>
+</div>
+
+<h2>Human review queue ({{len .Review}})</h2>
+<div class="panel tablewrap">
+{{if .Review}}
+<table>
+  <tr><th>ID</th><th>Shot</th><th>Model says</th><th>Conf.</th><th>Queue</th><th>Why it's here</th></tr>
+  {{range .Review}}
+  <tr>
+    <td class="id"><a href="{{$.Page.Base}}/items/{{.ID}}">{{.ID}}</a></td>
+    <td><b>{{.Handoff.ShotID}}</b><br><span class="muted">{{.Handoff.CurrentStage}} · {{.Handoff.Artist}}</span></td>
+    <td>{{with .Classification}}<span class="chip r-{{.Readiness}}">{{readiness .Readiness}}</span>{{end}}</td>
+    <td>{{with .Classification}}<span class="conf {{confClass .Confidence}}">{{pct .Confidence}}</span>{{end}}</td>
+    <td>{{.Queue}}</td>
+    <td class="muted">{{with .Decision}}{{.Reason}}{{end}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}{{if .All}}<p class="muted">Nothing waiting. Every handoff so far was confidently routed or already reviewed.</p>{{else}}<p class="muted">Empty for now — blocked shots, and handoffs the model isn't sure about, land here for you to approve or override.</p>{{end}}{{end}}
+</div>
+
+<h2>All handoffs</h2>
+<div class="panel tablewrap">
+{{if .All}}
+<table>
+  <tr><th>ID</th><th>Shot</th><th>Stage → next</th><th>Readiness</th><th>Conf.</th><th>Status</th><th>Queue</th></tr>
+  {{range .All}}
+  <tr>
+    <td class="id"><a href="{{$.Page.Base}}/items/{{.ID}}">{{.ID}}</a></td>
+    <td><b>{{.Handoff.ShotID}}</b>{{if .NeedsReview}} <span class="flag">· review</span>{{end}}<br><span class="muted">{{.Handoff.Artist}}</span></td>
+    <td>{{.Handoff.CurrentStage}}{{with .Decision}} → {{if .Advanced}}<b>{{.NextStage}}</b>{{else}}<span class="muted">{{.NextStage}}</span>{{end}}{{end}}</td>
+    {{with .Classification}}<td><span class="chip r-{{.Readiness}}">{{readiness .Readiness}}</span></td><td><span class="conf {{confClass .Confidence}}">{{pct .Confidence}}</span></td>{{else}}<td>—</td><td>—</td>{{end}}
+    <td>{{.Status}}</td>
+    <td>{{.Queue}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<div class="empty"><p><b>No handoffs yet.</b> Submit one to watch it get checked and routed — write your own coordinator note, or start from one of the example shot handoffs.</p><p><a class="btn" href="{{$.Page.Base}}/submit">+ Submit a handoff</a></p></div>{{end}}
+</div>
+
+<h2>Automatic actions (stubbed outbox)</h2>
+<div class="panel tablewrap">
+{{if .Outbox}}
+<table>
+  <tr><th>When</th><th>Kind</th><th>Target</th><th>What</th><th>Why</th></tr>
+  {{range .Outbox}}
+  <tr><td>{{when .At}}</td><td><span class="chip">{{.Kind}}</span></td><td>{{.Target}}</td><td>{{.Request.ItemID}} — {{.Detail}}</td><td class="muted">{{.Request.Reason}}</td></tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No actions yet.</p>{{end}}
+</div>
+{{template "foot"}}

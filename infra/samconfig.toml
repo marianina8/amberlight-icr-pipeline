@@ -1,0 +1,34 @@
+# AWS SAM CLI config for the Amberlight ICR pipeline. Run sam commands from
+# this directory (infra/), or use `make sam-build` / `make sam-deploy`.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "amberlight-icr-pipeline"
+profile = "demos-admin"   # the IAM Identity Center profile from `aws configure sso`
+region = "us-west-2"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "amberlight-icr-pipeline"
+parameter_overrides = "Stage=\"demo\" ClassifierProvider=\"bedrock\" BedrockInferenceProfileId=\"us.anthropic.claude-haiku-4-5-20251001-v1:0\" BedrockFoundationModelId=\"anthropic.claude-haiku-4-5-20251001-v1:0\" WebhookSharedSecretParam=\"amberlight-icr/webhook-shared-secret\""
+tags = "app=\"amberlight-icr\" data=\"synthetic\""
+image_repositories = []
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.local_invoke.parameters]
+env_vars = "local-env.json"

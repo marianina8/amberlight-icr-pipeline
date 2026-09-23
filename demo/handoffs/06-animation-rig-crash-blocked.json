@@ -1,0 +1,9 @@
+{
+  "shot_id": "MRB-212-022",
+  "show": "Marrow Bay",
+  "episode": "212",
+  "current_stage": "animation",
+  "artist": "Rafael Quint",
+  "notes": "Can't finish lip sync — the updated face rig for Wren still crashes on load, ticket's been with rigging since Monday. Body blocking is done, but I can't touch the mouth until that's sorted.",
+  "submitted_at": "2026-09-22T03:00:00Z"
+}

@@ -1,0 +1,209 @@
+package ingest
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+var now = time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+
+const good = `{"shot_id":"plc-104-020","show":"The Paper Lantern Club","episode":"104","current_stage":" Layout ","artist":"Noor Haddad","notes":"  Camera locked, no notes.  ","submitted_at":"2026-09-21T10:00:00Z"}`
+
+func TestNormalizeHandoff(t *testing.T) {
+	h, err := Normalize([]byte(good), "cli", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ShotID != "PLC-104-020" || h.CurrentStage != "layout" || h.Artist != "Noor Haddad" || h.Notes != "Camera locked, no notes." || h.Episode != "104" {
+		t.Errorf("got %+v", h)
+	}
+	if h.Source != "cli" || !h.ReceivedAt.Equal(time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("source/received_at = %s %v", h.Source, h.ReceivedAt)
+	}
+	if !strings.HasPrefix(h.ID, "AL-") || len(h.ID) != 11 {
+		t.Errorf("id = %q", h.ID)
+	}
+}
+
+func TestNormalizeRejectsInvalid(t *testing.T) {
+	for name, p := range map[string]string{
+		"bad json":         `{`,
+		"missing stage":    `{"shot_id":"A","artist":"B","notes":"x"}`,
+		"missing notes":    `{"shot_id":"A","current_stage":"layout","artist":"B","notes":"  "}`,
+		"missing shot":     `{"current_stage":"layout","artist":"B","notes":"x"}`,
+		"missing artist":   `{"shot_id":"A","current_stage":"layout","notes":"x"}`,
+		"notes too long":   `{"shot_id":"A","current_stage":"layout","artist":"B","notes":"` + strings.Repeat("x", MaxNotes+1) + `"}`,
+		"shot id too long": `{"shot_id":"` + strings.Repeat("A", 65) + `","current_stage":"layout","artist":"B","notes":"x"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Normalize([]byte(p), "cli", now); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestHandoffIDStableAndContentBased(t *testing.T) {
+	a, _ := Normalize([]byte(good), "cli", now)
+	b, _ := Normalize([]byte(good), "webhook", now.Add(time.Hour))
+	if a.ID != b.ID {
+		t.Errorf("same content should give same ID: %s vs %s", a.ID, b.ID)
+	}
+	c, _ := Normalize([]byte(strings.Replace(good, "Layout", "animation", 1)), "cli", now)
+	if a.ID == c.ID {
+		t.Error("the same shot handed off from a different stage is a different item")
+	}
+}
+
+func TestDirQueueLifecycle(t *testing.T) {
+	ctx := context.Background()
+	q, err := NewDirQueue(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"AL-1", "AL-2", "AL-3"} {
+		if err := q.Send(ctx, Handoff{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := q.Receive(ctx, 2)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v %d", err, len(msgs))
+	}
+	if msgs[0].Handoff.ID != "AL-1" || msgs[1].Handoff.ID != "AL-2" {
+		t.Errorf("not FIFO: %s %s", msgs[0].Handoff.ID, msgs[1].Handoff.ID)
+	}
+	if p, in, _ := q.Depth(); p != 1 || in != 2 {
+		t.Errorf("depth pending=%d inflight=%d", p, in)
+	}
+	if err := q.Ack(ctx, msgs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Nack(ctx, msgs[1], errors.New("boom")); err != nil {
+		t.Fatal(err)
+	}
+	if p, in, _ := q.Depth(); p != 2 || in != 0 {
+		t.Errorf("after nack: pending=%d inflight=%d, want 2/0", p, in)
+	}
+}
+
+func TestDirQueueDeadLetters(t *testing.T) {
+	ctx := context.Background()
+	q, _ := NewDirQueue(t.TempDir())
+	_ = q.Send(ctx, Handoff{ID: "AL-1"})
+	for i := 0; i < MaxAttempts; i++ {
+		ms := mustReceive(t, q, 1)
+		if len(ms) != 1 {
+			t.Fatalf("attempt %d: no message", i+1)
+		}
+		if ms[0].Attempts != i {
+			t.Errorf("attempts = %d, want %d", ms[0].Attempts, i)
+		}
+		_ = q.Nack(ctx, ms[0], errors.New("boom"))
+	}
+	if p, _, dead := q.Depth(); p != 0 || dead != 1 {
+		t.Errorf("pending=%d dead=%d, want 0/1", p, dead)
+	}
+}
+
+func mustReceive(t *testing.T, q *DirQueue, n int) []Message {
+	t.Helper()
+	ms, err := q.Receive(context.Background(), n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ms
+}
+
+func TestDirQueueRecover(t *testing.T) {
+	ctx := context.Background()
+	q, _ := NewDirQueue(t.TempDir())
+	_ = q.Send(ctx, Handoff{ID: "AL-1"})
+	mustReceive(t, q, 1) // claimed, never acked (worker "crashed")
+	if n, err := q.Recover(); err != nil || n != 1 {
+		t.Fatalf("recover = %d, %v", n, err)
+	}
+	if len(mustReceive(t, q, 1)) != 1 {
+		t.Error("recovered message should be receivable again")
+	}
+}
+
+func fakeSink(calls *[]string) Sink {
+	return func(_ context.Context, payload []byte, source string) (Handoff, bool, error) {
+		tk, err := Normalize(payload, source, now)
+		if err != nil {
+			return Handoff{}, false, err
+		}
+		*calls = append(*calls, source+":"+tk.ID)
+		return tk, false, nil
+	}
+}
+
+func TestDropZoneScan(t *testing.T) {
+	root := t.TempDir()
+	in := filepath.Join(root, "incoming")
+	_ = os.MkdirAll(in, 0o755)
+	_ = os.WriteFile(filepath.Join(in, "a.json"), []byte(`{"shot_id":"A-1","current_stage":"layout","artist":"B","notes":"x"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(in, "b.json"), []byte(`not json`), 0o644)
+	_ = os.WriteFile(filepath.Join(in, "ignore.txt"), []byte(`x`), 0o644)
+	var calls []string
+	ids, rejected, err := DropZone{Root: root, Sink: fakeSink(&calls)}.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || len(rejected) != 1 || rejected[0] != "b.json" {
+		t.Fatalf("ids=%v rejected=%v", ids, rejected)
+	}
+	if !strings.HasPrefix(calls[0], "dropzone:") {
+		t.Errorf("source should be dropzone: %v", calls)
+	}
+	for _, p := range []string{"processed/a.json", "rejected/b.json", "incoming/ignore.txt"} {
+		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
+			t.Errorf("expected %s: %v", p, err)
+		}
+	}
+}
+
+func TestWebhookHandler(t *testing.T) {
+	var calls []string
+	h := WebhookHandler(fakeSink(&calls))
+	cases := []struct {
+		body string
+		code int
+	}{
+		{`{"shot_id":"A-1","current_stage":"layout","artist":"B","notes":"hi"}`, http.StatusAccepted},
+		{`{"shot_id":"A-1"}`, http.StatusBadRequest},
+		{`nope`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/handoffs", strings.NewReader(tc.body)))
+		if rec.Code != tc.code {
+			t.Errorf("%s -> %d, want %d (%s)", tc.body, rec.Code, tc.code, rec.Body)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/handoffs", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /handoffs -> %d", rec.Code)
+	}
+	if len(calls) != 1 || !strings.HasPrefix(calls[0], "webhook:") {
+		t.Errorf("calls = %v", calls)
+	}
+}
+
+func TestHandoffIDIncludesWorkspace(t *testing.T) {
+	h, _ := Normalize([]byte(good), "cli", now)
+	a, b := h, h
+	a.Workspace, b.Workspace = "aa11", "bb22"
+	if HandoffID(a) == HandoffID(b) || HandoffID(a) == h.ID {
+		t.Error("the same handoff in two sandboxes must get different IDs")
+	}
+}

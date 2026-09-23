@@ -1,0 +1,18 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /handoffs",
+  "rawPath": "/demo/handoffs",
+  "headers": {
+    "content-type": "application/json",
+    "x-amberlight-token": "local-dev-token"
+  },
+  "requestContext": {
+    "http": {
+      "method": "POST",
+      "path": "/demo/handoffs"
+    },
+    "stage": "demo"
+  },
+  "body": "{\"shot_id\": \"PLC-104-020\", \"show\": \"The Paper Lantern Club\", \"episode\": \"104\", \"current_stage\": \"storyboard\", \"artist\": \"Noor Haddad\", \"notes\": \"Boards for 020 are locked. Ines signed off in Tuesday's review, timing sheet is attached, and there are no open notes. Handing to layout.\", \"submitted_at\": \"2026-09-21T16:05:00Z\"}",
+  "isBase64Encoded": false
+}

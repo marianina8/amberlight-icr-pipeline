@@ -1,0 +1,674 @@
+// Command icr is the Amberlight ICR pipeline CLI: ingest, classify, route,
+// status — plus review, outbox and an MCP server mode that exposes the same
+// operations to AI agents.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/marianina8/amberlight-icr-pipeline/internal/awsapp"
+	"github.com/marianina8/amberlight-icr-pipeline/internal/ingest"
+	"github.com/marianina8/amberlight-icr-pipeline/internal/mcp"
+	"github.com/marianina8/amberlight-icr-pipeline/internal/pipeline"
+	"github.com/marianina8/amberlight-icr-pipeline/internal/router"
+	"github.com/marianina8/amberlight-icr-pipeline/internal/store"
+)
+
+const usage = `icr — Amberlight shot-handoff Ingest -> Classify -> Route pipeline
+
+Usage:
+  icr [global flags] <command> [flags] [args]
+
+Commands:
+  ingest [-process] <file|dir|->...   normalize handoffs and enqueue them
+  classify -file <handoff.json>       preview readiness + stage lookup + routing (no writes)
+  classify <id>                       re-run the readiness check on a stored item and re-route it
+  route [-dry-run] <id>               (re-)apply routing rules to a classified item
+  status [-queue q] [-review] [id]    pipeline summary, a filtered list, or one item's audit trail
+  review approve <id> -reviewer NAME [-note TEXT]
+  review override <id> -reviewer NAME -readiness R [-note TEXT]
+  stages                              show the configured stage order and each stage's next stage
+  outbox                              show stubbed Slack posts and production-tracker updates
+  mcp [-allow-write tools]            serve the pipeline as MCP tools over stdio
+  reset -yes                          delete the local data dir (demo reset)
+
+Global flags:
+  -config PATH       instance config (env ICR_CONFIG, default config/amberlight.yaml)
+  -data DIR          local data dir (env ICR_DATA_DIR, default .icr)
+  -classifier NAME   mock | bedrock (env ICR_CLASSIFIER, default from config)
+  -json              machine-readable output where supported
+
+Against the deployed AWS stack (phase 5):
+  -store dynamo      use DynamoDB + SQS instead of the local data dir (env ICR_STORE)
+  -table NAME        DynamoDB table: the ItemsTableName stack output (env ICR_ITEMS_TABLE)
+  -queue-url URL     SQS queue for ingest: the HandoffQueueUrl output (env ICR_QUEUE_URL)
+  -profile NAME      AWS CLI profile, e.g. demos-admin (env AWS_PROFILE)
+`
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+type env struct {
+	ctx      context.Context
+	cfgPath  string
+	dataDir  string
+	clName   string
+	storeK   string
+	table    string
+	queueURL string
+	profile  string
+	asJSON   bool
+	stdin    io.Reader
+	out      io.Writer
+	errOut   io.Writer
+}
+
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("icr", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, usage) }
+	e := &env{ctx: ctx, stdin: stdin, out: stdout, errOut: stderr}
+	fs.StringVar(&e.cfgPath, "config", pipeline.Env("ICR_CONFIG", pipeline.DefaultConfig), "")
+	fs.StringVar(&e.dataDir, "data", pipeline.Env("ICR_DATA_DIR", pipeline.DefaultDataDir), "")
+	fs.StringVar(&e.clName, "classifier", pipeline.Env("ICR_CLASSIFIER", ""), "")
+	fs.StringVar(&e.storeK, "store", pipeline.Env("ICR_STORE", "file"), "")
+	fs.StringVar(&e.table, "table", os.Getenv("ICR_ITEMS_TABLE"), "")
+	fs.StringVar(&e.queueURL, "queue-url", os.Getenv("ICR_QUEUE_URL"), "")
+	fs.StringVar(&e.profile, "profile", os.Getenv("AWS_PROFILE"), "")
+	fs.BoolVar(&e.asJSON, "json", false, "")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() == 0 {
+		fs.Usage()
+		return 2
+	}
+	cmd, rest := fs.Arg(0), fs.Args()[1:]
+	var err error
+	switch cmd {
+	case "ingest":
+		err = e.ingest(rest)
+	case "classify":
+		err = e.classify(rest)
+	case "route":
+		err = e.route(rest)
+	case "status":
+		err = e.status(rest)
+	case "review":
+		err = e.review(rest)
+	case "outbox":
+		err = e.outbox(rest)
+	case "stages":
+		err = e.stages(rest)
+	case "mcp":
+		err = e.mcp(rest)
+	case "reset":
+		err = e.reset(rest)
+	case "help", "-h", "--help":
+		fmt.Fprint(stdout, usage)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown command %q\n\n%s", cmd, usage)
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		if errors.Is(err, flag.ErrHelp) || errors.Is(err, errUsage) {
+			return 2
+		}
+		return 1
+	}
+	return 0
+}
+
+var errUsage = errors.New("usage")
+
+// opened is a pipeline plus the local directory queue (nil against AWS,
+// where the worker Lambda consumes SQS).
+type opened struct {
+	*pipeline.Service
+	dirQueue *ingest.DirQueue
+}
+
+func (e *env) open() (*opened, error) {
+	lg := slog.New(slog.NewTextHandler(e.errOut, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	switch e.storeK {
+	case "file", "":
+		l, err := pipeline.OpenLocal(e.ctx, e.cfgPath, e.dataDir, e.clName, lg)
+		if err != nil {
+			return nil, err
+		}
+		return &opened{Service: l.Service, dirQueue: l.DirQueue}, nil
+	case "dynamo":
+		app, err := awsapp.New(e.ctx, awsapp.Options{ConfigPath: e.cfgPath, Table: e.table, QueueURL: e.queueURL,
+			Classifier: e.clName, Profile: e.profile, ActionLog: e.errOut, Log: lg})
+		if err != nil {
+			return nil, err
+		}
+		return &opened{Service: app.Svc}, nil
+	default:
+		return nil, fmt.Errorf("%w: -store must be file or dynamo", errUsage)
+	}
+}
+
+func (e *env) flags(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(e.errOut)
+	fs.BoolVar(&e.asJSON, "json", e.asJSON, "machine-readable output")
+	return fs
+}
+
+// parseInterleaved lets flags appear after positional args (icr route ID -dry-run).
+func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			return pos, nil
+		}
+		pos = append(pos, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+}
+
+func (e *env) printJSON(v any) error {
+	enc := json.NewEncoder(e.out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// ---- ingest ----------------------------------------------------------------
+
+func (e *env) ingest(args []string) error {
+	fs := e.flags("ingest")
+	process := fs.Bool("process", false, "also drain the queue now (skip running the worker)")
+	paths, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return fmt.Errorf("%w: icr ingest [-process] <file|dir|->...", errUsage)
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	type result struct {
+		File      string `json:"file"`
+		ID        string `json:"id,omitempty"`
+		Duplicate bool   `json:"duplicate,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	var results []result
+	var failed int
+	for _, path := range paths {
+		files, err := expand(path)
+		if err != nil {
+			return err
+		}
+		for _, f := range files {
+			var b []byte
+			if f == "-" {
+				b, err = io.ReadAll(e.stdin)
+			} else {
+				b, err = os.ReadFile(f)
+			}
+			if err != nil {
+				return err
+			}
+			t, dup, err := p.Ingest(e.ctx, b, "cli")
+			r := result{File: f, ID: t.ID, Duplicate: dup}
+			if err != nil {
+				r.Error = err.Error()
+				failed++
+			}
+			results = append(results, r)
+		}
+	}
+	processed := 0
+	if *process && p.dirQueue == nil {
+		*process = false
+		fmt.Fprintln(e.errOut, "note: -process ignored with -store dynamo; the worker Lambda processes the SQS queue")
+	}
+	if *process {
+		for {
+			n, err := p.RunOnce(e.ctx, 25)
+			processed += n
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				break
+			}
+		}
+	}
+	if e.asJSON {
+		return e.printJSON(map[string]any{"ingested": results, "processed": processed})
+	}
+	for _, r := range results {
+		switch {
+		case r.Error != "":
+			fmt.Fprintf(e.out, "REJECTED  %-40s %s\n", r.File, r.Error)
+		case r.Duplicate:
+			fmt.Fprintf(e.out, "duplicate %-40s %s (already ingested)\n", r.File, r.ID)
+		default:
+			fmt.Fprintf(e.out, "queued    %-40s %s\n", r.File, r.ID)
+		}
+	}
+	if *process {
+		fmt.Fprintf(e.out, "\nprocessed %d item(s). Run `icr status` to see where they went.\n", processed)
+	} else if p.dirQueue == nil {
+		fmt.Fprintln(e.out, "\nqueued to SQS; the worker Lambda will classify and route them.")
+	} else {
+		fmt.Fprintln(e.out, "\nqueued. Start the worker (go run ./cmd/worker) or re-run with -process.")
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d file(s) rejected", failed)
+	}
+	return nil
+}
+
+func expand(path string) ([]string, error) {
+	if path == "-" {
+		return []string{"-"}, nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return []string{path}, nil
+	}
+	matches, err := filepath.Glob(filepath.Join(path, "*.json"))
+	sort.Strings(matches)
+	return matches, err
+}
+
+// ---- classify / route ------------------------------------------------------
+
+func (e *env) classify(args []string) error {
+	fs := e.flags("classify")
+	file := fs.String("file", "", "preview a raw handoff file without storing anything")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	if *file != "" {
+		b, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		t, err := ingest.Normalize(b, "cli-preview", time.Now())
+		if err != nil {
+			return err
+		}
+		if _, err := p.Router.NextStage(t.CurrentStage); err != nil {
+			return err
+		}
+		c, d, err := p.Preview(e.ctx, t)
+		if err != nil {
+			return err
+		}
+		if e.asJSON {
+			return e.printJSON(map[string]any{"handoff": t, "classification": c, "decision": d, "dry_run": true})
+		}
+		fmt.Fprintf(e.out, "handoff     %s  %s finished %s (%s)\n", t.ID, t.ShotID, t.CurrentStage, t.Artist)
+		fmt.Fprintf(e.out, "readiness   %s\nconfidence  %.2f\nreasoning   %s\n", c.Readiness, c.Confidence, c.Reasoning)
+		fmt.Fprintf(e.out, "stage       %s -> %s (looked up from the stage order)\n", d.CurrentStage, d.NextStage)
+		fmt.Fprintf(e.out, "\nwould route -> queue %q via rule %q (advanced=%v, automatic=%v, needs_review=%v)\n", d.Queue, d.Rule, d.Advanced, d.Automatic, d.NeedsReview)
+		for _, a := range d.Actions {
+			fmt.Fprintf(e.out, "would run   %s %s\n", a.Type, a.Target)
+		}
+		fmt.Fprintln(e.out, "(dry run: nothing stored, no actions taken)")
+		return nil
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("%w: icr classify <id>  |  icr classify -file <handoff.json>", errUsage)
+	}
+	it, err := p.Reclassify(e.ctx, pos[0], "cli")
+	if err != nil {
+		return err
+	}
+	return e.showItem(it, false)
+}
+
+func (e *env) route(args []string) error {
+	fs := e.flags("route")
+	dry := fs.Bool("dry-run", false, "show the decision without storing it or running actions")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("%w: icr route [-dry-run] <id>", errUsage)
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	if *dry {
+		it, err := p.Get(e.ctx, pos[0])
+		if err != nil {
+			return err
+		}
+		if it.Classification == nil {
+			return pipeline.ErrNotClassified
+		}
+		d := p.Router.Route(it.Handoff, *it.Classification)
+		if e.asJSON {
+			return e.printJSON(d)
+		}
+		fmt.Fprintf(e.out, "%s -> queue %q via rule %q (%s -> %s, advanced=%v, automatic=%v, needs_review=%v)\n%s\n", it.ID, d.Queue, d.Rule, d.CurrentStage, d.NextStage, d.Advanced, d.Automatic, d.NeedsReview, d.Reason)
+		return nil
+	}
+	it, err := p.Route(e.ctx, pos[0], "cli")
+	if err != nil {
+		return err
+	}
+	return e.showItem(it, false)
+}
+
+// ---- status ----------------------------------------------------------------
+
+func (e *env) status(args []string) error {
+	fs := e.flags("status")
+	queue := fs.String("queue", "", "only items in this queue")
+	review := fs.Bool("review", false, "only items waiting on human review")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
+		return err
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	if len(pos) == 1 {
+		it, err := p.Get(e.ctx, pos[0])
+		if err != nil {
+			return err
+		}
+		return e.showItem(it, true)
+	}
+	f := store.Filter{Queue: *queue}
+	if *review {
+		yes := true
+		f.NeedsReview = &yes
+	}
+	items, err := p.List(e.ctx, f)
+	if err != nil {
+		return err
+	}
+	st, err := p.Stats(e.ctx)
+	if err != nil {
+		return err
+	}
+	var qinfo map[string]int
+	if p.dirQueue != nil {
+		pending, inflight, dead := p.dirQueue.Depth()
+		qinfo = map[string]int{"pending": pending, "inflight": inflight, "dead": dead}
+	}
+	if e.asJSON {
+		return e.printJSON(map[string]any{"stats": st, "queue": qinfo, "items": items})
+	}
+	fmt.Fprintf(e.out, "%d item(s) | %d routed automatically | %d waiting on human review", st.Total, st.Automatic, st.NeedsReview)
+	if qinfo != nil {
+		fmt.Fprintf(e.out, " | queue: %d pending, %d in flight, %d dead-lettered", qinfo["pending"], qinfo["inflight"], qinfo["dead"])
+	}
+	fmt.Fprint(e.out, "\n\n")
+	tw := tabwriter.NewWriter(e.out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tSHOT\tSTAGE\tNEXT\tREADINESS\tCONF\tSTATUS\tQUEUE\tREVIEW\tARTIST")
+	for _, it := range items {
+		rd, conf, next := "-", "-", "-"
+		if c := it.Classification; c != nil {
+			rd, conf = c.Readiness, fmt.Sprintf("%.2f", c.Confidence)
+		}
+		if d := it.Decision; d != nil {
+			next = d.NextStage
+			if d.Advanced {
+				next += " (advanced)"
+			}
+		}
+		rv := ""
+		if it.NeedsReview {
+			rv = "YES"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Handoff.ShotID, it.Handoff.CurrentStage, next, rd, conf, it.Status, orDash(it.Queue), rv, trunc(it.Handoff.Artist, 32))
+	}
+	return tw.Flush()
+}
+
+func (e *env) showItem(it store.Item, withEvents bool) error {
+	if e.asJSON {
+		return e.printJSON(it)
+	}
+	t := it.Handoff
+	fmt.Fprintf(e.out, "%s  [%s]  %s finished %s\n", it.ID, it.Status, t.ShotID, t.CurrentStage)
+	fmt.Fprintf(e.out, "artist      %s · %s ep %s via %s\n", t.Artist, t.Show, t.Episode, t.Source)
+	if c := it.Classification; c != nil {
+		fmt.Fprintf(e.out, "readiness   %s @ %.2f  (%s", c.Readiness, c.Confidence, c.Classifier)
+		if c.HumanVerified {
+			fmt.Fprint(e.out, ", human-verified")
+		}
+		fmt.Fprintf(e.out, ")\nreasoning   %s\n", c.Reasoning)
+	}
+	if d := it.Decision; d != nil {
+		fmt.Fprintf(e.out, "stage       %s -> %s (advanced=%v)\n", d.CurrentStage, d.NextStage, d.Advanced)
+		fmt.Fprintf(e.out, "routed      queue=%s rule=%s automatic=%v needs_review=%v\nreason      %s\n", d.Queue, d.Rule, d.Automatic, it.NeedsReview, d.Reason)
+	}
+	if withEvents {
+		fmt.Fprintln(e.out, "\naudit trail:")
+		for _, ev := range it.Events {
+			fmt.Fprintf(e.out, "  %s  %-10s %-18s %s\n", ev.At.Format(time.RFC3339), ev.Type, ev.Actor, ev.Detail)
+		}
+	}
+	return nil
+}
+
+// ---- review ----------------------------------------------------------------
+
+func (e *env) review(args []string) error {
+	if len(args) == 0 || (args[0] != "approve" && args[0] != "override") {
+		return fmt.Errorf("%w: icr review approve|override <id> -reviewer NAME ...", errUsage)
+	}
+	fs := e.flags("review " + args[0])
+	reviewer := fs.String("reviewer", os.Getenv("USER"), "who is making this decision (recorded in the audit trail)")
+	note := fs.String("note", "", "optional note")
+	readiness := fs.String("readiness", "", "override: corrected readiness (ready_for_next_stage, needs_revision, blocked)")
+	pos, err := parseInterleaved(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fmt.Errorf("%w: icr review %s <id> -reviewer NAME", errUsage, args[0])
+	}
+	if *reviewer == "" {
+		return fmt.Errorf("%w: -reviewer is required", errUsage)
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	var it store.Item
+	if args[0] == "approve" {
+		it, err = p.Approve(e.ctx, pos[0], "cli:"+*reviewer, *note)
+	} else {
+		it, err = p.Override(e.ctx, pos[0], "cli:"+*reviewer, *readiness, *note)
+	}
+	if err != nil {
+		return err
+	}
+	return e.showItem(it, false)
+}
+
+// ---- outbox ----------------------------------------------------------------
+
+func (e *env) outbox(args []string) error {
+	fs := e.flags("outbox")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	var entries []router.OutboxEntry
+	var err error
+	if e.storeK == "dynamo" {
+		p, oerr := e.open()
+		if oerr != nil {
+			return oerr
+		}
+		items, lerr := p.List(e.ctx, store.Filter{})
+		if lerr != nil {
+			return lerr
+		}
+		entries = pipeline.ActionsFromItems(items)
+	} else if entries, err = router.ReadOutbox(pipeline.OutboxDir(e.dataDir)); err != nil {
+		return err
+	}
+	if e.asJSON {
+		return e.printJSON(entries)
+	}
+	if len(entries) == 0 {
+		fmt.Fprintln(e.out, "outbox is empty (no automatic actions yet)")
+		return nil
+	}
+	for _, en := range entries {
+		ref := en.Ref
+		if ref == "" {
+			ref = "-"
+		}
+		if en.Target != "" {
+			ref = en.Target
+		}
+		fmt.Fprintf(e.out, "%s  %-7s %-26s %s  %s\n", en.At.Format("15:04:05"), en.Kind, ref, en.Request.ItemID, en.Detail)
+		fmt.Fprintf(e.out, "          why: %s\n", en.Request.Reason)
+	}
+	return nil
+}
+
+// ---- stages ----------------------------------------------------------------
+
+// stages prints the configured stage order and each stage's looked-up next
+// stage — the table the router uses. The model never sees or changes it.
+func (e *env) stages(args []string) error {
+	fs := e.flags("stages")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	type row struct {
+		Stage string `json:"stage"`
+		Next  string `json:"next_stage"`
+	}
+	var rows []row
+	for _, st := range p.Cfg.Pipeline.StageSequence {
+		next, err := p.Router.NextStage(st)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row{st, next})
+	}
+	if e.asJSON {
+		return e.printJSON(rows)
+	}
+	tw := tabwriter.NewWriter(e.out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "#\tSTAGE\tNEXT STAGE (when ready)")
+	for i, r := range rows {
+		fmt.Fprintf(tw, "%d\t%s\t%s\n", i+1, r.Stage, r.Next)
+	}
+	return tw.Flush()
+}
+
+// ---- mcp -------------------------------------------------------------------
+
+func (e *env) mcp(args []string) error {
+	fs := e.flags("mcp")
+	allow := fs.String("allow-write", "", "comma-separated write tools to enable: "+strings.Join(mcp.WriteToolNames(), ","))
+	actor := fs.String("actor", "agent", "name recorded in the audit trail for write calls")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	allowed, err := mcp.ParseAllowWrite(*allow)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	p, err := e.open()
+	if err != nil {
+		return err
+	}
+	srv := &mcp.Server{Svc: p.Service, AllowWrite: allowed, Actor: *actor, Version: "0.1.0"}
+	fmt.Fprintf(e.errOut, "icr mcp: serving on stdio (write tools enabled: %s)\n", describeAllowed(allowed))
+	return srv.Serve(e.ctx, bufio.NewReader(e.stdin), e.out)
+}
+
+func describeAllowed(m map[string]bool) string {
+	if len(m) == 0 {
+		return "none — read-only"
+	}
+	var xs []string
+	for k := range m {
+		xs = append(xs, k)
+	}
+	sort.Strings(xs)
+	return strings.Join(xs, ", ")
+}
+
+// ---- reset -----------------------------------------------------------------
+
+func (e *env) reset(args []string) error {
+	fs := e.flags("reset")
+	yes := fs.Bool("yes", false, "confirm deletion of the data dir")
+	if _, err := parseInterleaved(fs, args); err != nil {
+		return err
+	}
+	if !*yes {
+		return fmt.Errorf("%w: this deletes %s; re-run with -yes", errUsage, e.dataDir)
+	}
+	clean := filepath.Clean(e.dataDir)
+	if clean == "." || clean == "/" || clean == ".." {
+		return fmt.Errorf("refusing to delete %q", e.dataDir)
+	}
+	if err := os.RemoveAll(clean); err != nil {
+		return err
+	}
+	fmt.Fprintf(e.out, "removed %s\n", clean)
+	return nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func trunc(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}

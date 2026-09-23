@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "amberlight-icr": {
+      "command": "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/bin/icr",
+      "args": [
+        "-config", "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/config/amberlight.yaml",
+        "-data", "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/.icr",
+        "mcp"
+      ]
+    },
+    "amberlight-icr-with-routing": {
+      "command": "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/bin/icr",
+      "args": [
+        "-config", "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/config/amberlight.yaml",
+        "-data", "/ABSOLUTE/PATH/TO/amberlight-icr-pipeline/.icr",
+        "mcp", "-allow-write", "route_item,reclassify", "-actor", "triage-agent"
+      ]
+    }
+  }
+}

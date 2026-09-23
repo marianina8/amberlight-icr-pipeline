@@ -1,0 +1,44 @@
+{{template "head" .Page}}
+{{if .Error}}<p class="panel err">{{.Error}}</p>{{end}}
+<h2 style="margin-top:0">Submit a shot handoff</h2>
+<p class="muted">Send a handoff through the real pipeline: it is normalized, queued, checked for readiness by the model, and routed by Amberlight's rules. The next stage is looked up from the stage order, never guessed. Use synthetic data only.</p>
+
+<form class="panel" method="get" action="{{$.Page.Base}}/submit" style="margin-bottom:14px">
+  <label>Start from an example shot handoff
+    <select name="example" onchange="this.form.submit()">
+      <option value="">— choose an example —</option>
+      {{range .Examples}}<option value="{{.Name}}"{{if eq .Name $.Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+    </select>
+  </label>
+  <noscript><button type="submit" class="secondary">Load</button></noscript>
+</form>
+
+<div class="grid2">
+  <form class="panel" method="post" action="{{$.Page.Base}}/submit">
+    <b>Write a handoff</b>
+    <input type="hidden" name="mode" value="form">
+    <div class="row">
+      <label>Shot ID<input name="shot_id" required placeholder="EX-101-010" maxlength="64"></label>
+      <label>Stage just finished
+        <select name="current_stage">{{range .Stages}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+      </label>
+    </div>
+    <div class="row">
+      <label>Show<input name="show" placeholder="Fictional Show" maxlength="120"></label>
+      <label>Episode<input name="episode" placeholder="101" maxlength="64"></label>
+    </div>
+    <label>Artist<input name="artist" required placeholder="Alex Example" maxlength="120"></label>
+    <label>Notes<textarea name="notes" required maxlength="8000" style="min-height:160px;font:inherit" placeholder="Write it the way an artist or coordinator actually would — hedges, asides and all…"></textarea></label>
+    <button type="submit">Submit handoff</button>
+  </form>
+
+  <form class="panel" method="post" action="{{$.Page.Base}}/submit" enctype="multipart/form-data">
+    <b>…or paste / upload handoff JSON</b>
+    <span class="muted">Same shape as <code>demo/handoffs/*.json</code>.</span>
+    <input type="hidden" name="mode" value="json">
+    <label>Handoff JSON<textarea name="json" spellcheck="false">{{.JSON}}</textarea></label>
+    <label>…or upload a .json file<input type="file" name="file" accept=".json,application/json"></label>
+    <button type="submit">Submit JSON</button>
+  </form>
+</div>
+{{template "foot"}}

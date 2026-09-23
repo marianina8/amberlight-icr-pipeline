@@ -1,0 +1,15 @@
+{
+  "Records": [
+    {
+      "messageId": "local-1",
+      "receiptHandle": "local",
+      "body": "{\"id\": \"AL-LOCAL001\", \"source\": \"webhook\", \"received_at\": \"2026-09-21T17:32:00Z\", \"shot_id\": \"MRB-211-044\", \"show\": \"Marrow Bay\", \"episode\": \"211\", \"current_stage\": \"lighting\", \"artist\": \"Dev Okafor\", \"notes\": \"Lighting approved in dailies, final renders signed off, no notes.\"}",
+      "attributes": {},
+      "messageAttributes": {},
+      "md5OfBody": "",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-west-2:000000000000:local-HandoffQueue",
+      "awsRegion": "us-west-2"
+    }
+  ]
+}

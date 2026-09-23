@@ -1,0 +1,82 @@
+{{template "head" .Page}}
+{{if .Flash}}<p class="panel flash">{{.Flash}}</p>{{end}}
+{{if .Error}}<p class="panel err">{{.Error}}</p>{{end}}
+{{if eq .Item.Status "received"}}<p class="panel banner"><span class="spinner"></span> Checking readiness… this page refreshes automatically (usually a few seconds).</p>{{end}}
+{{with .Item}}
+<p><a href="{{$.Page.Base}}/">← back to queue</a></p>
+<h2 style="margin-top:0">{{.ID}} · {{.Handoff.ShotID}} · {{.Handoff.CurrentStage}}</h2>
+<p class="muted">Status <b>{{.Status}}</b> · queue <b>{{if .Queue}}{{.Queue}}{{else}}—{{end}}</b>{{if .NeedsReview}} · <span class="flag">needs human review</span>{{end}}</p>
+
+<div class="grid2">
+  <div class="panel">
+    <h2 style="margin-top:0">Handoff</h2>
+    <dl>
+      <dt>Shot</dt><dd>{{.Handoff.ShotID}}</dd>
+      <dt>Show</dt><dd>{{.Handoff.Show}}{{with .Handoff.Episode}} · ep {{.}}{{end}}</dd>
+      <dt>Stage finished</dt><dd><span class="chip">{{.Handoff.CurrentStage}}</span></dd>
+      <dt>Artist</dt><dd>{{.Handoff.Artist}}</dd>
+      <dt>Received</dt><dd>{{when .Handoff.ReceivedAt}} (via {{.Handoff.Source}})</dd>
+    </dl>
+    <hr style="border:0;border-top:1px solid var(--line)">
+    <pre class="body">{{.Handoff.Notes}}</pre>
+  </div>
+  <div class="panel">
+    <h2 style="margin-top:0">Model readiness check</h2>
+    {{with .Classification}}
+    <dl>
+      <dt>Readiness</dt><dd><span class="chip r-{{.Readiness}}">{{readiness .Readiness}}</span></dd>
+      <dt>Confidence</dt><dd><span class="conf {{confClass .Confidence}}">{{pct .Confidence}}</span>{{if .HumanVerified}} · human-verified{{end}}</dd>
+      <dt>Reasoning</dt><dd>{{.Reasoning}}</dd>
+      <dt>Classifier</dt><dd class="muted">{{.Classifier}}</dd>
+    </dl>
+    {{else}}<p class="muted">Not checked yet.</p>{{end}}
+    {{with .Decision}}
+    <h2>Routing decision</h2>
+    <dl>
+      <dt>Stage</dt><dd>{{.CurrentStage}} → {{if .Advanced}}<b>{{.NextStage}}</b> (advanced){{else}}<span class="muted">{{.NextStage}} (not advanced)</span>{{end}}</dd>
+      <dt>Rule</dt><dd>{{.Rule}}</dd>
+      <dt>Queue</dt><dd>{{.Queue}}</dd>
+      <dt>Automatic</dt><dd>{{.Automatic}}</dd>
+      <dt>Reason</dt><dd class="muted">{{.Reason}}</dd>
+    </dl>
+    <p class="muted" style="font-size:13px;margin-bottom:0">The next stage is looked up from the studio's configured stage order — the model only judges readiness.</p>
+    {{end}}
+    {{with .Review}}
+    <h2>Review</h2>
+    <p>{{.Outcome}} by {{.Reviewer}} at {{when .At}}{{if .Note}} — “{{.Note}}”{{end}}</p>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+{{if .Item.Classification}}
+<h2>Decide</h2>
+<div class="grid2">
+  <form class="panel" method="post" action="{{$.Page.Base}}/items/{{.Item.ID}}/approve">
+    <b>Approve the model's verdict</b>
+    <span class="muted">Routes it as human-verified: ready advances, needs revision goes back to the artist, blocked is held.</span>
+    <label>Reviewer<input name="reviewer" value="{{.Reviewer}}" required></label>
+    <label>Note (optional)<input name="note" placeholder="Looks right"></label>
+    <button type="submit">Approve</button>
+  </form>
+  <form class="panel" method="post" action="{{$.Page.Base}}/items/{{.Item.ID}}/override">
+    <b>Override</b>
+    <span class="muted">Correct the readiness, then route. The next stage still comes from the stage order.</span>
+    {{$c := .Item.Classification}}
+    <label>Readiness<select name="readiness">{{range .Readiness}}<option value="{{.}}"{{if eq . $c.Readiness}} selected{{end}}>{{readiness .}}</option>{{end}}</select></label>
+    <label>Reviewer<input name="reviewer" value="{{.Reviewer}}" required></label>
+    <label>Note<input name="note" placeholder="Why the model was wrong"></label>
+    <button type="submit" class="secondary">Override &amp; route</button>
+  </form>
+</div>
+{{end}}
+
+<h2>Audit trail</h2>
+<div class="panel">
+  <ul class="events">
+  {{range .Item.Events}}
+    <li><code>{{when .At}}</code> <span class="chip">{{.Type}}</span> <b>{{.Actor}}</b> — {{.Detail}}</li>
+  {{end}}
+  </ul>
+</div>
+{{template "foot"}}

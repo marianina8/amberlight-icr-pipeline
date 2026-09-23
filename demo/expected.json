@@ -1,0 +1,55 @@
+{
+  "_comment": "Intended outcome for each fixture, used by compare/ and tests. readiness \"\" means any verdict is acceptable as long as it routes to a human.",
+  "fixtures": {
+    "01-storyboard-locked-direct.json": {
+      "readiness": "ready_for_next_stage",
+      "route": "advance",
+      "why": "Direct and unambiguous: signed off, nothing open. Should auto-advance to layout."
+    },
+    "02-layout-hedged-open-note.json": {
+      "readiness": "needs_revision",
+      "route": "return_to_artist",
+      "why": "Hedged, and the director's dailies note hasn't been addressed. Back to the artist, not onward."
+    },
+    "03-animation-sarcastic-ready.json": {
+      "readiness": "needs_revision",
+      "route": "return_to_artist",
+      "why": "Sarcastic 'ready' over a real intersection problem. Keyword matching reads 'ready'."
+    },
+    "04-lighting-buried-missing-asset.json": {
+      "readiness": "blocked",
+      "route": "supervisor_review",
+      "why": "The real issue (unpublished upstream asset) is buried mid-sentence between positive phrases."
+    },
+    "05-compositing-final-delivered.json": {
+      "readiness": "ready_for_next_stage",
+      "route": "advance",
+      "why": "Last stage in the sequence: the stage lookup must return 'delivered', not wrap or error."
+    },
+    "06-animation-rig-crash-blocked.json": {
+      "readiness": "blocked",
+      "route": "supervisor_review",
+      "why": "A plainly stated block outside the artist's control."
+    },
+    "07-layout-vague.json": {
+      "readiness": "",
+      "route": "coordinator_review",
+      "why": "Too vague to judge; any verdict should come with low confidence and go to a coordinator."
+    },
+    "08-animation-approved-but-redo.json": {
+      "readiness": "needs_revision",
+      "route": "return_to_artist",
+      "why": "Opens with 'Approved!', but a director change is still outstanding."
+    },
+    "09-lighting-casual-ready.json": {
+      "readiness": "ready_for_next_stage",
+      "route": "advance",
+      "why": "Casual and hedged in tone, but approved with no open work. None of the naive 'ready' keywords appear."
+    },
+    "10-storyboard-waiting-on-director.json": {
+      "readiness": "blocked",
+      "route": "supervisor_review",
+      "why": "Says 'done', but a pending creative decision blocks the next department."
+    }
+  }
+}
